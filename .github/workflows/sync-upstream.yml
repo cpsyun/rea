@@ -1,0 +1,17 @@
+name: Sync Upstream
+on:
+  schedule:
+    - cron: '0 8 * * *' # 每天UTC 8点执行，可自行调整
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync repository
+        uses: repo-sync/github-sync@v2
+        with:
+          source_repo: "morluto/rea" # 上游原仓库
+          source_branch: "main" # 上游分支，改成实际主分支名
+          destination_branch: "main" # 你的fork分支
+          github_token: ${{ secrets.GITHUB_TOKEN }}
