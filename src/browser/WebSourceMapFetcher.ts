@@ -2,7 +2,6 @@ import * as t from "@babel/types";
 import {
   decodeValidatedSourceMapLeaves,
   isBeforeSourceMapLeafStop,
-  resolveSourceMapSource,
 } from "../javascript/sourceMaps/DecodedSourceMap.js";
 
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
@@ -12,6 +11,12 @@ import { isUrlLikeModuleSpecifier } from "../domain/webBundleAnalyzerAst.js";
 import { analyzeParsedJavaScriptReferences } from "../domain/javascript/javascriptSemanticAnalysis.js";
 import { traverseJavaScriptAst } from "../domain/javascript/javascriptSemanticTraversal.js";
 import { parseJavaScriptSource } from "../domain/javascript/javascriptSourceParser.js";
+import {
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyImportDeclaration,
+  semanticImportEqualsSpecifier,
+} from "../domain/javascript/javascriptModuleDeclaration.js";
+import { stringValue } from "../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type {
   AnalyzeWebBundleInput,
   WebSourceMapItem,
@@ -21,12 +26,18 @@ import { webSourceMapsSchema } from "../domain/webBundleAnalysis.js";
 import { createWebTextArtifact } from "../domain/webContentArtifact.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { sourceMapJsonText } from "../domain/sourceMapEnvelope.js";
+import { resolveJavaScriptSourceMapUrl } from "../domain/javascript/javascriptSourceMapPaths.js";
 import { jsonParts } from "../domain/jsonSerialization.js";
 import {
   inspectSourceMapValue,
   SourceMapFormatFailure,
   type SourceMapLeaf,
 } from "../javascript/sourceMaps/SourceMapFormat.js";
+import {
+  noRuntimeOverrideSentence,
+  selectedBrowserDeadlineMs,
+} from "../domain/browserDeadline.js";
+import { DEFAULT_SOURCE_MAP_FETCH_TIMEOUT_MS } from "../domain/webBundleAnalysis.js";
 import { WEB_SOURCE_MAP_LIMITS } from "../domain/webSourceLocation.js";
 
 export interface WebSourceMapRequest {
@@ -47,7 +58,10 @@ interface SourceMapFetchHost {
 // Bound a stalled server to 30 seconds and bound raw map input retained for
 // parsing to 64 MiB per inspection. Both limits apply at the network boundary;
 // hitting either produces an explicit fetch_failed item, never truncated data.
-const SOURCE_MAP_FETCH_TIMEOUT_MS = 30_000;
+const SOURCE_MAP_FETCH_TIMEOUT_MS = DEFAULT_SOURCE_MAP_FETCH_TIMEOUT_MS;
+
+const sourceMapFetchDeadlineLimitation = (timeoutMs: number): string =>
+  `Source-map fetch exceeded its ${String(timeoutMs)} ms source_map_fetch_timeout_ms deadline (fetch_failed). This is an item limitation, not a thrown analysis timeout, and not the source-map decode deadline. ${noRuntimeOverrideSentence(`The ${String(SOURCE_MAP_RESPONSE_BYTES)}-byte response budget stays fixed.`, "source_map_fetch_timeout_ms")}`;
 const SOURCE_MAP_RESPONSE_BYTES = 64 * 1024 * 1024;
 const SOURCE_MAP_OUTPUT_BYTES = WEB_SOURCE_MAP_LIMITS.outputBytes;
 const SOURCE_MAP_FAILURE_LIMITATION_RESERVE = 512;
@@ -62,6 +76,7 @@ type ParsedSourceMapItem = Extract<
 interface SourceMapDecodeContext {
   readonly signal: AbortSignal | undefined;
   readonly deadlineAt: number;
+  readonly deadlineLimitation: string;
   readonly budget: {
     records: number;
     expandedBytes: number;
@@ -76,20 +91,39 @@ export const fetchWebSourceMaps = async (
   signal?: AbortSignal,
   host: SourceMapFetchHost = { fetch: globalThis.fetch },
 ): Promise<SourceMaps> => {
+  throwIfAborted(signal);
+  if (requests.length === 0)
+    return webSourceMapsSchema.parse({
+      status: "not_requested",
+      requested: 0,
+      processed: 0,
+      items: [],
+    });
   const items: SourceMapItem[] = [];
   const operationController = new AbortController();
+  const fetchTimeoutMs =
+    host.timeoutMs ??
+    selectedBrowserDeadlineMs(
+      input.source_map_fetch_timeout_ms,
+      SOURCE_MAP_FETCH_TIMEOUT_MS,
+    );
+  const fetchDeadlineLimitation =
+    sourceMapFetchDeadlineLimitation(fetchTimeoutMs);
   const timeout = setTimeout(
-    () => operationController.abort(new SourceMapDeadlineError()),
-    host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS,
+    () =>
+      operationController.abort(
+        new SourceMapDeadlineError(fetchDeadlineLimitation),
+      ),
+    fetchTimeoutMs,
   );
   const abortFromCaller = (): void => operationController.abort(signal?.reason);
   signal?.addEventListener("abort", abortFromCaller, { once: true });
   const operationSignal = operationController.signal;
-  const deadlineAt =
-    Date.now() + (host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS);
+  const deadlineAt = performance.now() + fetchTimeoutMs;
   const budget = {
     retainedBytes: 0,
     deadlineAt,
+    deadlineLimitation: fetchDeadlineLimitation,
     decodedRecords: {
       records: 0,
       expandedBytes: SOURCE_MAP_COLLECTION_ENVELOPE_RESERVE,
@@ -110,13 +144,9 @@ export const fetchWebSourceMaps = async (
       }
       const expandedBytesBeforeItem = budget.decodedRecords.expandedBytes;
       budget.decodedRecords.expandedBytes += reservation;
-      if (operationSignal.aborted || Date.now() >= deadlineAt) {
+      if (operationSignal.aborted || performance.now() >= deadlineAt) {
         items.push(
-          emptySourceMapItem(
-            request,
-            "fetch_failed",
-            "Source-map fetching exceeded its operation deadline.",
-          ),
+          emptySourceMapItem(request, "fetch_failed", fetchDeadlineLimitation),
         );
         continue;
       }
@@ -165,6 +195,10 @@ export const fetchWebSourceMaps = async (
   });
 };
 
+const throwIfAborted = (signal?: AbortSignal): void => {
+  if (signal?.aborted === true) throw signal.reason;
+};
+
 const sourceMapOutputLimitation = (unprocessed: number): string =>
   `source-map output budget could not retain results for ${String(unprocessed)} requested map${unprocessed === 1 ? "" : "s"}. their results are unknown.`;
 
@@ -184,15 +218,17 @@ const sourceMapsStatus = (
 };
 
 class SourceMapDeadlineError extends Error {
-  constructor() {
-    super("Source-map fetching exceeded its operation deadline.");
+  constructor(message: string) {
+    super(message);
     this.name = "SourceMapDeadlineError";
   }
 }
 
 class SourceMapSizeLimitError extends Error {
   constructor() {
-    super("Source-map response exceeded the retained-byte budget.");
+    super(
+      `Source-map response exceeded the ${String(SOURCE_MAP_RESPONSE_BYTES)}-byte retained budget. ${noRuntimeOverrideSentence("That response budget stays fixed.", "source_map_fetch_timeout_ms")}`,
+    );
     this.name = "SourceMapSizeLimitError";
   }
 }
@@ -221,6 +257,7 @@ const fetchOne = async (
   budget: {
     retainedBytes: number;
     deadlineAt: number;
+    deadlineLimitation: string;
     decodedRecords: {
       records: number;
       expandedBytes: number;
@@ -285,7 +322,12 @@ const fetchOne = async (
         fetchedUrl,
       );
     }
-    checkOperation(undefined, signal, budget.deadlineAt);
+    checkOperation(
+      undefined,
+      signal,
+      budget.deadlineAt,
+      budget.deadlineLimitation,
+    );
     return normalizeSourceMap(
       request,
       await readBoundedText(
@@ -298,6 +340,7 @@ const fetchOne = async (
       {
         signal,
         deadlineAt: budget.deadlineAt,
+        deadlineLimitation: budget.deadlineLimitation,
         budget: budget.decodedRecords,
       },
     );
@@ -479,7 +522,6 @@ const promiseWithAbort = (
   signal: AbortSignal | undefined,
 ): Promise<Response> => {
   if (signal === undefined) return promise;
-  if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = (): void => signal.removeEventListener("abort", abort);
@@ -512,6 +554,7 @@ const promiseWithAbort = (
         reject(cause);
       },
     );
+    if (signal.aborted) abort();
   });
 };
 
@@ -532,7 +575,12 @@ const normalizeSourceMap = (
   const retainedBytesBeforeMap = context.budget.expandedBytes;
   try {
     const check = (): void =>
-      checkOperation(undefined, context.signal, context.deadlineAt);
+      checkOperation(
+        undefined,
+        context.signal,
+        context.deadlineAt,
+        context.deadlineLimitation,
+      );
     const inspected = inspectSourceMapValue(parsedJson.value, {
       profile: "browser-collection",
       budget: context.budget,
@@ -728,7 +776,10 @@ const originalModuleEdges = (
       );
       continue;
     }
-    const parsed = parseJavaScriptSource(source.artifact.text);
+    const parsed = parseJavaScriptSource(
+      source.artifact.text,
+      sourceParserPath(sourceName),
+    );
     check();
     if (parsed === null) {
       incomplete.push(sourceName);
@@ -743,8 +794,8 @@ const originalModuleEdges = (
         check();
         const dependency = originalDependency(node);
         if (dependency === null) return;
-        const { kind, specifier } = dependency;
-        if (kind === "require" && t.isCallExpression(node)) {
+        const { kind, specifier, requireCallee } = dependency;
+        if (requireCallee !== undefined) {
           unboundRequires ??= new Set(
             analyzeParsedJavaScriptReferences(parsed, "require")
               .filter(
@@ -756,7 +807,7 @@ const originalModuleEdges = (
                   `${String(location.start.line)}:${String(location.start.column)}`,
               ),
           );
-          const location = node.callee.loc?.start;
+          const location = requireCallee.loc?.start;
           if (
             location === undefined ||
             !unboundRequires.has(
@@ -782,14 +833,27 @@ const originalModuleEdges = (
   return { edges, incomplete };
 };
 
+/** Select parser semantics from the source URL path, excluding query/fragment. */
+const sourceParserPath = (source: string): string => {
+  try {
+    return new URL(source).pathname;
+  } catch (cause: unknown) {
+    // Unresolved source identities can still carry a useful relative path.
+    void cause;
+    return source;
+  }
+};
+
 const checkOperation = (
   callerSignal: AbortSignal | undefined,
   operationSignal: AbortSignal | undefined,
   deadlineAt: number,
+  deadlineLimitation: string,
 ): void => {
   if (callerSignal?.aborted === true) throw callerSignal.reason;
   if (operationSignal?.aborted === true) throw operationSignal.reason;
-  if (Date.now() >= deadlineAt) throw new SourceMapDeadlineError();
+  if (performance.now() >= deadlineAt)
+    throw new SourceMapDeadlineError(deadlineLimitation);
 };
 
 const approvedUrl = (
@@ -867,7 +931,11 @@ const preflightResolvedSourceBytes = (
       const sourceKey = source;
       let resolved = sourcesForRoot.get(sourceKey);
       if (resolved === undefined)
-        resolved = resolveSourceMapSource(source, map.sourceRoot, mapUrl);
+        resolved = resolveJavaScriptSourceMapUrl(
+          source,
+          map.sourceRoot,
+          mapUrl,
+        );
       const bytes = Buffer.byteLength(resolved, "utf8");
       if (bytes > SOURCE_MAP_RESPONSE_BYTES - resolvedBytes)
         throw resolvedSourceLimitFailure();
@@ -894,7 +962,7 @@ const consumeExpandedBytes = (
 const expandedOutputFailure = (): SourceMapFormatFailure =>
   new SourceMapFormatFailure(
     "limit",
-    `Expanded source-map evidence exceeds the ${WEB_SOURCE_MAP_LIMITS.outputBytes / (1024 * 1024)} MiB public representation budget.`,
+    `Expanded source-map evidence exceeds the ${String(WEB_SOURCE_MAP_LIMITS.outputBytes)}-byte public representation budget. ${noRuntimeOverrideSentence("That representation budget stays fixed.", "source_map_fetch_timeout_ms")}`,
   );
 
 const sourceMapOutputError = (
@@ -912,7 +980,7 @@ const sourceMapOutputError = (
 const resolvedSourceLimitFailure = (): SourceMapFormatFailure =>
   new SourceMapFormatFailure(
     "limit",
-    `Resolved source-map identities exceed the ${SOURCE_MAP_RESPONSE_BYTES / (1024 * 1024)} MiB decoder representation budget.`,
+    `Resolved source-map identities exceed the ${String(SOURCE_MAP_RESPONSE_BYTES / (1024 * 1024))} MiB decoder representation budget. ${noRuntimeOverrideSentence("That representation budget stays fixed.", "source_map_fetch_timeout_ms")}`,
   );
 
 const jsonBytes = (value: string): number => {
@@ -1035,34 +1103,41 @@ const originalDependency = (
 ): {
   readonly kind: ParsedSourceMapItem["original_module_edges"][number]["kind"];
   readonly specifier: string;
+  readonly requireCallee?: t.Identifier;
 } | null => {
   if (
     t.isImportDeclaration(node) ||
     t.isExportAllDeclaration(node) ||
     t.isExportNamedDeclaration(node)
   )
-    return node.source === null || node.source === undefined
+    return node.source === null ||
+      node.source === undefined ||
+      (t.isImportDeclaration(node)
+        ? isTypeOnlyImportDeclaration(node)
+        : isTypeOnlyExportDeclaration(node))
       ? null
       : { kind: "static_import", specifier: node.source.value };
-  if (t.isImportExpression(node) && t.isStringLiteral(node.source))
-    return { kind: "dynamic_import", specifier: node.source.value };
+  if (t.isImportExpression(node)) {
+    const specifier = stringValue(node.source);
+    return specifier === undefined
+      ? null
+      : { kind: "dynamic_import", specifier };
+  }
   if (
-    t.isCallExpression(node) &&
-    t.isIdentifier(node.callee, { name: "require" }) &&
-    t.isStringLiteral(node.arguments[0])
-  )
-    return { kind: "require", specifier: node.arguments[0].value };
+    (t.isCallExpression(node) || t.isOptionalCallExpression(node)) &&
+    t.isIdentifier(node.callee, { name: "require" })
+  ) {
+    const specifier = stringValue(node.arguments[0]);
+    return specifier === undefined
+      ? null
+      : { kind: "require", specifier, requireCallee: node.callee };
+  }
   // `import x = require("m")` is only legal at module top level and always
-  // refers to the host loader, so it needs no unbound-`require` check. The
-  // `moduleReference` is an entity name for a local alias instead, which
-  // declares no dependency.
-  if (
-    t.isTSImportEqualsDeclaration(node) &&
-    t.isTSExternalModuleReference(node.moduleReference)
-  )
-    return {
-      kind: "require",
-      specifier: node.moduleReference.expression.value,
-    };
+  // refers to the host loader, so it needs no unbound-`require` check. An
+  // entity-name alias or an erased `import type` declares no dependency.
+  if (t.isTSImportEqualsDeclaration(node)) {
+    const specifier = semanticImportEqualsSpecifier(node);
+    return specifier === null ? null : { kind: "require", specifier };
+  }
   return null;
 };

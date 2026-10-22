@@ -22,6 +22,8 @@ import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
+  AnalysisInputError,
+  AnalysisUnsupportedTargetError,
 } from "../domain/analysisErrorCore.js";
 import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
@@ -38,6 +40,7 @@ import { inspectManagedArtifactBytes } from "./ManagedArtifactInspector.js";
 import { inspectManagedMembersBytes } from "./ManagedMemberInspector.js";
 import { inspectManagedNativeBoundariesBytes } from "./ManagedNativeBoundaryInspector.js";
 import { RegularFileCleanupFailure } from "../application/RegularFileRead.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 import {
   hashManagedSource,
   managedCleanupError,
@@ -83,11 +86,13 @@ class ManagedStaticClient implements AnalysisClient {
           "Operation is not implemented by the managed static provider.",
         ),
       );
+    // A non-PE target is outside this operation's formats, not a missing
+    // provider capability; the unimplemented-operation refusal above is.
     if (this.target.format !== "pe")
       return err(
-        new AnalysisCapabilityUnavailableError(
-          MANAGED_STATIC_PROVIDER.id,
+        new AnalysisUnsupportedTargetError(
           operation,
+          this.target.path,
           `Managed static triage requires a PE target; observed ${this.target.format}.`,
         ),
       );
@@ -135,6 +140,20 @@ class ManagedStaticClient implements AnalysisClient {
       if (cause instanceof AnalysisError) return err(cause);
       if (options?.signal?.aborted === true)
         return err(new AnalysisCancelledError(operation));
+      // A PE header or section table the reader cannot map is malformed input.
+      if (
+        cause instanceof ManagedReaderFailure &&
+        cause.issue.code !== "resource-limit"
+      )
+        return err(
+          new AnalysisInputError(operation, { cause }, [
+            {
+              path: ["path"],
+              reason: "invalid_format",
+              message: `Selected artifact ${this.target.path}: ${cause.issue.detail}`,
+            },
+          ]),
+        );
       return err(
         new ProviderAdapterError(MANAGED_STATIC_PROVIDER.id, operation, {
           cause,

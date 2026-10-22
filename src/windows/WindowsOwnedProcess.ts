@@ -11,7 +11,7 @@ import {
 } from "./WindowsNativeLoader.js";
 
 const launchSchema = z.strictObject({
-  pid: z.number().int().positive().max(0xffff_ffff),
+  pid: z.int().positive().max(0xffff_ffff),
   handle: windowsHandleSchema,
   jobAssigned: z.literal(true),
   killOnOwnerClose: z.literal(true),
@@ -21,18 +21,14 @@ const pollSchema = z.strictObject({
   stderr: z.instanceof(Buffer),
   stdoutEnded: z.boolean(),
   stderrEnded: z.boolean(),
-  exitCode: z.number().int().nonnegative().max(0xffff_ffff).nullable(),
-  activeProcesses: z.number().int().nonnegative(),
+  exitCode: z.int().nonnegative().max(0xffff_ffff).nullable(),
+  activeProcesses: z.int().nonnegative(),
 });
 // A commit-limited job reports its applied limit at launch and its
 // notification state on every poll; an unlimited job reports neither.
 const limitedPollSchema = pollSchema.extend({
   memoryLimitReached: z.boolean(),
-  peakJobMemoryBytes: z
-    .number()
-    .int()
-    .nonnegative()
-    .max(Number.MAX_SAFE_INTEGER),
+  peakJobMemoryBytes: z.int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 
 /** Optional native job controls for one owned Windows process tree. */
@@ -65,12 +61,20 @@ export class WindowsOwnedProcess extends EventEmitter {
   readonly #settled: Promise<void>;
   #settle: (() => void) | undefined;
   #closed = false;
+  // Settlement was observed and stream teardown finished, but process_close
+  // has not released every native handle. Later cleanup retries that close
+  // alone; kill and poll still need the job or process handle.
+  #releasePending = false;
   #failure: string | undefined;
   #timer: NodeJS.Timeout | undefined;
+  #blockedWake: NodeJS.Timeout | undefined;
+  readonly #blockedOutput = new Set<PassThrough>();
+  #unreferenced = false;
   #cleanup: Promise<ProcessCleanupResult> | undefined;
   readonly #memoryLimitBytes: number | undefined;
   #memoryLimitReached = false;
   #peakJobMemoryBytes: number | undefined;
+  #outputIncomplete = false;
 
   constructor(
     command: string,
@@ -178,10 +182,14 @@ export class WindowsOwnedProcess extends EventEmitter {
     return this.#peakJobMemoryBytes;
   }
 
+  /** True when cleanup destroyed a backpressured stream before all output was observed. */
+  get outputIncomplete(): boolean {
+    return this.#outputIncomplete;
+  }
+
   async #writeInput(chunk: unknown): Promise<void> {
     const bytes = z.instanceof(Buffer).parse(chunk);
     const written = z
-      .number()
       .int()
       .nonnegative()
       .max(Number.MAX_SAFE_INTEGER)
@@ -222,11 +230,37 @@ export class WindowsOwnedProcess extends EventEmitter {
     return this.#cleanup;
   }
 
+  /** Release event-loop references so unsettled jobs do not prevent host exit. */
+  unref(): void {
+    this.#unreferenced = true;
+    this.#timer?.unref();
+    this.#blockedWake?.unref();
+  }
+
+  /** Restore event-loop references when retrying process lifecycle observation. */
+  ref(): void {
+    this.#unreferenced = false;
+    this.#timer?.ref();
+    this.#blockedWake?.ref();
+  }
+
   async #stop(): Promise<ProcessCleanupResult> {
     if (this.#closed) return { cleaned: true, signaled: false };
+    if (this.#releasePending) {
+      try {
+        this.#release();
+        return { cleaned: true, signaled: false };
+      } catch (cause: unknown) {
+        return {
+          cleaned: false,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        };
+      }
+    }
     let timer: NodeJS.Timeout | undefined;
     try {
       const signaled = this.kill();
+      this.#discardBlockedOutput();
       this.#schedule();
       const settled = await Promise.race([
         this.#settled.then(() => true),
@@ -252,14 +286,64 @@ export class WindowsOwnedProcess extends EventEmitter {
     }
   }
 
-  #schedule(): void {
-    if (this.#closed || this.#timer !== undefined) return;
-    this.#timer = setTimeout(() => this.#poll(), 25);
+  #schedule(delay = 25): void {
+    if (
+      this.#closed ||
+      this.#timer !== undefined ||
+      this.#blockedOutput.size > 0
+    )
+      return;
+    this.#timer = setTimeout(() => this.#poll(), delay);
+    if (this.#unreferenced) this.#timer.unref();
+  }
+
+  #scheduleBlockedWake(): void {
+    if (
+      this.#closed ||
+      this.#blockedOutput.size === 0 ||
+      this.#blockedWake !== undefined
+    )
+      return;
+    this.#blockedWake = setTimeout(() => {
+      this.#blockedWake = undefined;
+      this.#scheduleBlockedWake();
+    }, 1_000);
+    if (this.#unreferenced) this.#blockedWake.unref();
+  }
+
+  #clearBlockedWake(): void {
+    if (this.#blockedWake !== undefined) clearTimeout(this.#blockedWake);
+    this.#blockedWake = undefined;
+  }
+
+  #unblockOutput(stream: PassThrough): void {
+    if (stream.destroyed) this.#outputIncomplete = true;
+    this.#blockedOutput.delete(stream);
+    if (this.#blockedOutput.size === 0) this.#clearBlockedWake();
+    this.#schedule(0);
+  }
+
+  #discardBlockedOutput(): void {
+    if (this.#blockedOutput.size > 0) this.#outputIncomplete = true;
+    for (const stream of this.#blockedOutput) stream.destroy();
+    this.#blockedOutput.clear();
+    this.#clearBlockedWake();
   }
 
   #poll(): void {
     this.#timer = undefined;
     if (this.#closed) return;
+    if (this.#releasePending) {
+      try {
+        this.#release();
+      } catch (cause: unknown) {
+        const failure =
+          cause instanceof Error ? cause : new Error(String(cause));
+        this.#failure = failure.message;
+        if (this.listenerCount("error") > 0) this.emit("error", failure);
+      }
+      return;
+    }
     try {
       const observed: unknown = this.#authority.call("process_poll", [
         this.#handle,
@@ -275,8 +359,11 @@ export class WindowsOwnedProcess extends EventEmitter {
         state = limited;
       }
       this.#failure = undefined;
-      if (state.stdout.length > 0) this.stdout.write(state.stdout);
-      if (state.stderr.length > 0) this.stderr.write(state.stderr);
+      // Stop native reads while either consumer is backpressured. A slower
+      // cadence still accumulates unbounded unread output in the parent heap.
+      const idle = state.stdout.length === 0 && state.stderr.length === 0;
+      this.#writeOutput(this.stdout, state.stdout);
+      this.#writeOutput(this.stderr, state.stderr);
       if (state.exitCode !== null && this.exitCode === null) {
         this.exitCode = state.exitCode;
         this.emit("exit", state.exitCode, null);
@@ -288,25 +375,51 @@ export class WindowsOwnedProcess extends EventEmitter {
         state.activeProcesses === 0
       ) {
         this.#release();
-      } else this.#schedule();
+      } else this.#schedule(idle ? 25 : 0);
     } catch (cause: unknown) {
       const failure = cause instanceof Error ? cause : new Error(String(cause));
       this.#failure = failure.message;
       // Native lifecycle failures belong to the error/cleanup channels, never
       // the captured stderr observation produced by the child itself.
       if (this.listenerCount("error") > 0) this.emit("error", failure);
-      // Retain the original job so explicit cleanup can retry its observation.
+      // Poll failures keep the job for another observation. A process_close
+      // failure leaves #releasePending so cleanup retries that close alone.
     }
+  }
+
+  #writeOutput(stream: PassThrough, bytes: Buffer): void {
+    if (bytes.length === 0 || stream.writableEnded) return;
+    if (stream.destroyed) {
+      this.#outputIncomplete = true;
+      return;
+    }
+    if (stream.write(bytes)) return;
+    this.#blockedOutput.add(stream);
+    const unblock = () => {
+      stream.off("drain", unblock);
+      stream.off("close", unblock);
+      this.#unblockOutput(stream);
+    };
+    stream.once("drain", unblock);
+    stream.once("close", unblock);
+    this.#scheduleBlockedWake();
   }
 
   #release(): void {
     if (this.#closed) return;
-    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    if (!this.#releasePending) {
+      if (this.#timer !== undefined) clearTimeout(this.#timer);
+      this.#timer = undefined;
+      this.#clearBlockedWake();
+      this.stdin?.destroy();
+      if (!this.stdout.destroyed) this.stdout.end();
+      if (!this.stderr.destroyed) this.stderr.end();
+      this.#releasePending = true;
+    }
+    // Streams are already ended. A failed close retries this call alone.
     this.#authority.call("process_close", [this.#handle]);
+    this.#releasePending = false;
     this.#closed = true;
-    this.stdin?.destroy();
-    this.stdout.end();
-    this.stderr.end();
     this.#settle?.();
     this.emit("close", this.exitCode, null);
   }

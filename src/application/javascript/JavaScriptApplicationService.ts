@@ -1,3 +1,7 @@
+import {
+  ASAR_HEADER_ADMISSION_SETTING,
+  parseAsarHeaderAdmission,
+} from "../../config/asarHeaderAdmission.js";
 import { z } from "zod";
 
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
@@ -29,11 +33,16 @@ import { JAVASCRIPT_APPLICATION_PROVIDER } from "../InvestigationProviders.js";
 
 const OPERATION = "analyze_javascript_application" as const;
 
+/** Execution options plus the composition root's environment for admission settings. */
+export interface JavaScriptApplicationOptions extends ExecutionOptions {
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+}
+
 /** Statically analyze one local JavaScript/Electron application. */
 export const analyzeJavaScriptApplication = async (
   rawInput: unknown,
   scope: ArtifactResourceScope,
-  options: ExecutionOptions = {},
+  options: JavaScriptApplicationOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
   const parsed = analyzeJavaScriptApplicationInputSchema.safeParse(rawInput);
   if (!parsed.success)
@@ -47,8 +56,13 @@ export const analyzeJavaScriptApplication = async (
 export const analyzeJavaScriptApplicationValidated = async (
   input: z.output<typeof analyzeJavaScriptApplicationInputSchema>,
   scope: ArtifactResourceScope,
-  options: ExecutionOptions = {},
+  options: JavaScriptApplicationOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
+  // An invalid setting is refused before analysis, never replaced by the default.
+  const asarHeaderAdmission = parseAsarHeaderAdmission(
+    options.environment?.[ASAR_HEADER_ADMISSION_SETTING],
+  );
+  if (!asarHeaderAdmission.ok) return asarHeaderAdmission;
   let reconstructed: JavaScriptArtifactReconstructionResult | undefined;
   let result: JavaScriptApplicationAnalysisResult | undefined;
   let evidence: Evidence | undefined;
@@ -62,29 +76,11 @@ export const analyzeJavaScriptApplicationValidated = async (
     });
     await checkpointJavaScriptAnalysis(options.signal);
     reconstructed = await reconstructJavaScriptArtifact(
-      {
-        input_path: input.input_path,
-        format: input.format,
-        integrity_policy: input.integrity_policy,
-        ...(input.max_semantic_nodes === undefined
-          ? {}
-          : { max_semantic_nodes: input.max_semantic_nodes }),
-        ...(input.max_semantic_nodes_per_file === undefined
-          ? {}
-          : { max_semantic_nodes_per_file: input.max_semantic_nodes_per_file }),
-        ...(input.source_paths === undefined
-          ? {}
-          : { source_paths: input.source_paths }),
-        ...(input.max_heap_mb === undefined
-          ? {}
-          : { max_heap_mb: input.max_heap_mb }),
-        ...(input.analysis_timeout_ms === undefined
-          ? {}
-          : { analysis_timeout_ms: input.analysis_timeout_ms }),
-      },
+      input,
       scope,
       options.signal,
       options.progress,
+      asarHeaderAdmission.value,
     );
     const { electron_summary: summary, ...application } = reconstructed;
     await options.progress?.report({
@@ -207,6 +203,7 @@ const artifactFailureToOperationError = (
       ...(cause.partialObservation === undefined
         ? {}
         : { partialObservation: cause.partialObservation }),
+      ...(cause.admission === undefined ? {} : { admission: cause.admission }),
     },
   );
 

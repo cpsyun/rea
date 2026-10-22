@@ -1,18 +1,16 @@
-import { createHash } from "node:crypto";
-
-import canonicalize from "canonicalize";
+import { digestCanonicalValue } from "./canonicalDigest.js";
 import { z } from "zod";
 
 import { artifactComparisonResultSchema } from "./artifactComparison.js";
 import { uniqueSorted } from "./canonicalOrdering.js";
 import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
-import { comparisonSourceEvidenceIds } from "./comparisonSourceEvidence.js";
-import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
-import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
 import {
-  PROCESS_PROVIDER,
-  isProcessEvidenceProvider,
-} from "./process/processEvidenceProvider.js";
+  comparisonSourceEvidenceIds,
+  assertComparisonFindingLinks,
+} from "./comparisonSourceEvidence.js";
+import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
+import { hasComparisonEvidenceIdentity } from "./comparisonEvidenceIdentity.js";
+import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
 import type { JsonValue } from "./jsonValue.js";
 import {
   comparisonStatusSchema,
@@ -124,9 +122,9 @@ const correlationItemSchema = z.object({
 export const staticRuntimeCorrelationResultSchema = z.object({
   status: z.enum(["correlated", "contradicted", "unknown", "truncated"]),
   summary: z.object({
-    hypotheses: z.number().int().min(0),
-    contradictions: z.number().int().min(0),
-    unresolved: z.number().int().min(0),
+    hypotheses: z.int().min(0),
+    contradictions: z.int().min(0),
+    unresolved: z.int().min(0),
   }),
   correlations: z.object({
     items: z.array(correlationItemSchema),
@@ -141,26 +139,6 @@ export type StaticRuntimeCorrelationResult = z.infer<
 type Mapping = z.infer<typeof mappingSchema>;
 type CorrelationItem = z.infer<typeof correlationItemSchema>;
 type ComparisonStatus = z.infer<typeof comparisonStatusSchema>;
-
-type ComparisonIdentity = readonly [string | readonly string[], string, string];
-
-const EXPECTED: Readonly<Record<string, ComparisonIdentity>> = {
-  compare_artifacts: [
-    "rea.artifact-comparison",
-    "rea-artifact-comparison",
-    "REA artifact comparison",
-  ],
-  compare_functions: [
-    "rea.function-comparison",
-    "rea-function-comparison",
-    "REA function comparison",
-  ],
-  compare_process_captures: [
-    "rea.process-comparison",
-    PROCESS_PROVIDER.id,
-    PROCESS_PROVIDER.name,
-  ],
-};
 
 /** Correlate only caller-declared static/runtime hypotheses. */
 export const correlateStaticAndRuntime = (
@@ -236,7 +214,10 @@ const correlate = (
     mapping.runtime.comparison_evidence_id,
     "runtime comparison",
   );
-  const selectedStatic = selectStatic(staticEvidence, mapping.static.selector);
+  const { limitations: selectedLimitations, ...selectedStatic } = selectStatic(
+    staticEvidence,
+    mapping.static.selector,
+  );
   const process = processCaptureComparisonSchema.parse(
     runtimeEvidence.normalized_result,
   );
@@ -255,7 +236,7 @@ const correlate = (
     hypothesis: mapping.hypothesis,
   } satisfies JsonValue;
   return correlationItemSchema.parse({
-    correlation_id: `cor_${sha256(canonicalJson(projection))}`,
+    correlation_id: `cor_${digestCanonicalValue(projection, "Static/runtime correlation")}`,
     static: { ...mapping.static, ...selectedStatic },
     runtime: { ...mapping.runtime, status: runtimeStatus },
     side_alignment: mapping.side_alignment,
@@ -270,6 +251,7 @@ const correlate = (
     ]),
     limitations: uniqueSorted([
       ...staticEvidence.limitations,
+      ...selectedLimitations,
       ...runtimeEvidence.limitations,
       ...process.limitations,
       "This correlation tests an explicit hypothesis and does not establish causality.",
@@ -281,7 +263,9 @@ const correlate = (
 const selectStatic = (
   evidence: Evidence,
   selector: z.infer<typeof staticSelectorSchema>,
-): Pick<CorrelationItem["static"], "status" | "conclusion_kind"> => {
+): Pick<CorrelationItem["static"], "status" | "conclusion_kind"> & {
+  readonly limitations: readonly string[];
+} => {
   if (selector.kind === "function") {
     if (evidence.operation !== "compare_functions")
       throw new TypeError(
@@ -299,6 +283,7 @@ const selectStatic = (
     return {
       status: match.status,
       conclusion_kind: match.conclusion_kind,
+      limitations: match.limitations,
     };
   }
   if (evidence.operation !== "compare_artifacts")
@@ -319,6 +304,7 @@ const selectStatic = (
   const status = match.classification;
   return {
     status,
+    limitations: [],
     conclusion_kind:
       status === "contradiction"
         ? "contradiction"
@@ -342,7 +328,7 @@ const parseStatic = (input: unknown): Evidence => {
     const result = artifactComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertNestedLinks(
+    assertComparisonFindingLinks(
       evidence,
       result.changes.flatMap(({ evidence_links: links }) => links),
     );
@@ -350,23 +336,12 @@ const parseStatic = (input: unknown): Evidence => {
     const result = functionComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertNestedLinks(
+    assertComparisonFindingLinks(
       evidence,
       result.dimensions.flatMap(({ evidence_links: links }) => links),
     );
   }
   return evidence;
-};
-
-const assertNestedLinks = (
-  evidence: Evidence,
-  nestedLinks: readonly string[],
-): void => {
-  const closure = new Set(evidence.evidence_links);
-  if (nestedLinks.some((evidenceId) => !closure.has(evidenceId)))
-    throw new TypeError(
-      "Comparison finding cites Evidence outside its top-level closure",
-    );
 };
 
 const parseRuntime = (input: unknown): Evidence => {
@@ -381,21 +356,7 @@ const parseRuntime = (input: unknown): Evidence => {
 };
 
 const assertComparisonIdentity = (evidence: Evidence): void => {
-  const expected = EXPECTED[evidence.operation];
-  if (
-    expected === undefined ||
-    !(Array.isArray(expected[0])
-      ? expected[0].includes(evidence.predicate_type)
-      : evidence.predicate_type === expected[0]) ||
-    (evidence.operation === "compare_process_captures"
-      ? !isProcessEvidenceProvider(evidence.provider)
-      : evidence.provider.id !== expected[1] ||
-        evidence.provider.name !== expected[2] ||
-        evidence.provider.version !== "1") ||
-    evidence.confidence !== "derived" ||
-    evidence.authority !== "analyst-inference" ||
-    evidence.subject !== null
-  )
+  if (!hasComparisonEvidenceIdentity(evidence))
     throw new TypeError(
       "Comparison Evidence operation, predicate, provider, or citations disagree",
     );
@@ -447,16 +408,4 @@ const assertUnique = (evidence: readonly Evidence[], label: string): void => {
     throw new TypeError(
       `Static/runtime correlation rejects duplicate ${label}`,
     );
-};
-
-const sha256 = (value: string): string =>
-  createHash("sha256").update(value).digest("hex");
-
-const canonicalJson = (value: JsonValue): string => {
-  const serialized = canonicalize(value);
-  if (serialized === undefined)
-    throw new TypeError(
-      "RFC 8785 canonicalization rejected correlation mapping",
-    );
-  return serialized;
 };

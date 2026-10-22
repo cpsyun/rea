@@ -1,5 +1,6 @@
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
+import { FUNCTION_COMPARISON_PROVIDER } from "../domain/comparisonEvidenceIdentity.js";
 import { compareProcessCaptures } from "../domain/process/processComparison.js";
 import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 import { FUNCTION_COMPARISON_EXAMPLE } from "./functionComparisonExample.js";
@@ -13,11 +14,7 @@ const comparison = compareFunctions(
 
 export const FUNCTION_COMPARISON_EVIDENCE = createEvidence(
   undefined,
-  {
-    id: "rea-function-comparison",
-    name: "REA function comparison",
-    version: "1",
-  },
+  FUNCTION_COMPARISON_PROVIDER,
   {
     predicateType: "rea.function-comparison",
     operation: "compare_functions",
@@ -28,6 +25,7 @@ export const FUNCTION_COMPARISON_EVIDENCE = createEvidence(
     result: jsonValueSchema.parse(comparison),
     confidence: "derived",
     authority: "analyst-inference",
+    limitations: comparison.limitations,
     evidenceLinks: [
       FUNCTION_COMPARISON_EXAMPLE.left.evidence_id,
       FUNCTION_COMPARISON_EXAMPLE.right.evidence_id,

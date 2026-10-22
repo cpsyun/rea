@@ -5,9 +5,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PURE_LAYERS = new Set(["domain", "contracts"]);
 const MIGRATED_PROVIDER_ROOTS = new Set([
+  "sqlite",
   "evm",
   "go",
+  "il2cpp",
+  "model",
+  "gpu",
+  "rust",
   "wasm",
+  "captures",
+  "signals",
   "android",
   "firmware",
   "ghidra",
