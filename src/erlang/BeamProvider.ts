@@ -1,12 +1,18 @@
+import { ERLANG_BEAM_PROVIDER_IDENTITY } from "./ErlangBeamProviderIdentity.js";
+import {
+  projectStableArtifactFailure,
+  stableArtifactInputRecovery,
+  projectArtifactCloseFailure,
+} from "../artifacts/StableArtifactFailure.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { readStableArtifact } from "../artifacts/readStableArtifact.js";
 import {
-  ArtifactFileCleanupFailure,
-  bindArtifactFileCleanup,
+  artifactFilePrimaryFacts,
+  type ArtifactFilePrimaryFacts,
+  artifactSelectedPathErrno,
   artifactFileCancellationCause,
 } from "../artifacts/ArtifactFileOperation.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
-import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import type { BeamPort } from "../application/erlang/BeamPort.js";
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import { ArtifactOperationError } from "../domain/artifactOperationError.js";
@@ -21,19 +27,10 @@ import {
   MAX_INSPECT_ERLANG_BEAM_ATOMS,
   MAX_INSPECT_ERLANG_BEAM_CHUNKS,
   MAX_INSPECT_ERLANG_BEAM_FILE_BYTES,
-  MAX_INSPECT_ERLANG_BEAM_TABLE_ROWS,
   type InspectErlangBeamInput,
 } from "../domain/erlang/beam.js";
 import { err, ok } from "../domain/result.js";
-import { ProviderCleanupError } from "../domain/providerCleanupError.js";
-import { parseErlangBeam } from "./BeamParser.js";
-
-/** Bundled format reader identity; module names are separate observed facts. */
-export const ERLANG_BEAM_PROVIDER_IDENTITY = {
-  id: "rea-erlang-beam",
-  name: "REA Erlang BEAM reader",
-  version: "1",
-} as const;
+import { BeamCapacityFailure, parseErlangBeam } from "./BeamParser.js";
 
 const OPERATION = "inspect_erlang_beam";
 
@@ -46,19 +43,11 @@ export class BeamProvider implements BeamPort {
     try {
       await this.#resources.close();
     } catch (cause: unknown) {
-      if (
-        !(cause instanceof ArtifactReaderFailure) ||
-        cause.cleanup === undefined
-      )
-        throw cause;
-      const error = new ProviderCleanupError(
+      throw projectArtifactCloseFailure(
+        cause,
         ERLANG_BEAM_PROVIDER_IDENTITY.id,
-        cause.cleanup.resources,
-        { reason: cause.cleanup.reason },
-        { cause, operation: OPERATION },
+        OPERATION,
       );
-      bindArtifactFileCleanup(cause, error);
-      throw error;
     }
   }
 
@@ -85,33 +74,44 @@ export class BeamProvider implements BeamPort {
         );
       });
     } catch (cause) {
-      return err(beamFailure(cause, input, options?.signal));
+      return err(beamFailure(cause, input));
     }
   }
 }
 
 const inputBudgetRemediation = (
-  boundary: "file-size" | "capacity",
+  cause: ArtifactReaderFailure,
   input: InspectErlangBeamInput,
-  message: string,
-): string => {
-  if (boundary === "file-size")
+): string | undefined => {
+  if (cause.boundary === "file-size")
     return input.max_file_bytes >= MAX_INSPECT_ERLANG_BEAM_FILE_BYTES
       ? `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_FILE_BYTES)}-byte input ceiling this operation accepts; select a smaller artifact.`
       : `Raise max_file_bytes above ${String(input.max_file_bytes)} bytes or select a smaller artifact; the limit is the caller-selected input read budget.`;
-  if (message.includes("atom"))
-    return input.max_atoms >= MAX_INSPECT_ERLANG_BEAM_ATOMS
-      ? `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_ATOMS)}-atom ceiling this operation accepts; select a smaller artifact.`
-      : `Raise max_atoms above ${String(input.max_atoms)} or select a smaller artifact; the limit is the caller-selected atom budget.`;
-  if (message.includes("row budget"))
-    return `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_TABLE_ROWS)}-row ceiling this operation accepts; select a smaller artifact.`;
-  return input.max_chunks >= MAX_INSPECT_ERLANG_BEAM_CHUNKS
-    ? `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_CHUNKS)}-chunk ceiling this operation accepts; select a smaller artifact.`
-    : `Raise max_chunks above ${String(input.max_chunks)} or select a smaller artifact; the limit is the caller-selected chunk budget.`;
+  if (!(cause instanceof BeamCapacityFailure)) return undefined;
+  switch (cause.resource) {
+    case "atoms":
+      return cause.maximum >= MAX_INSPECT_ERLANG_BEAM_ATOMS
+        ? `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_ATOMS)}-atom ceiling this operation accepts; select a smaller artifact.`
+        : `Raise max_atoms above ${String(cause.maximum)} or select a smaller artifact; the limit is the caller-selected atom budget.`;
+    case "table-rows":
+      return `The file exceeds the ${String(cause.maximum)}-row ceiling this operation accepts; select a smaller artifact.`;
+    case "chunks":
+      return cause.maximum >= MAX_INSPECT_ERLANG_BEAM_CHUNKS
+        ? `The file exceeds the ${String(MAX_INSPECT_ERLANG_BEAM_CHUNKS)}-chunk ceiling this operation accepts; select a smaller artifact.`
+        : `Raise max_chunks above ${String(cause.maximum)} or select a smaller artifact; the limit is the caller-selected chunk budget.`;
+  }
 };
 
-const beamFailurePrimary = (cause: unknown, input: InspectErlangBeamInput) => {
-  if (cause instanceof ArtifactReaderFailure && cause.reason === "integrity")
+const beamFailurePrimary = (
+  facts: ArtifactFilePrimaryFacts,
+  input: InspectErlangBeamInput,
+) => {
+  const { cause, origin } = facts;
+  if (
+    origin === "owned-or-classified" &&
+    cause instanceof ArtifactReaderFailure &&
+    cause.reason === "integrity"
+  )
     return new AnalysisArtifactChangedError(
       OPERATION,
       input.path,
@@ -120,12 +120,20 @@ const beamFailurePrimary = (cause: unknown, input: InspectErlangBeamInput) => {
         cause,
       },
     );
-  if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+  if (
+    origin === "owned-or-classified" &&
+    cause instanceof ArtifactReaderFailure &&
+    cause.reason === "cancelled"
+  )
     return new AnalysisCancelledError(OPERATION, {
       cause: artifactFileCancellationCause(cause),
     });
-  if (cause instanceof ArtifactReaderFailure) {
-    if (cause.reason === "limit")
+  if (
+    origin === "owned-or-classified" &&
+    cause instanceof ArtifactReaderFailure
+  ) {
+    if (cause.reason === "limit") {
+      const remediationAction = inputBudgetRemediation(cause, input);
       return new AnalysisResourceConstraintError(
         OPERATION,
         cause.boundary ?? "memory",
@@ -137,75 +145,61 @@ const beamFailurePrimary = (cause: unknown, input: InspectErlangBeamInput) => {
         },
         {
           cause,
-          ...(cause.boundary === undefined || cause.boundary === "memory"
+          ...(remediationAction === undefined
             ? {}
             : {
                 retryable: false,
-                remediationAction: inputBudgetRemediation(
-                  cause.boundary,
-                  input,
-                  cause.message,
-                ),
+                remediationAction,
               }),
         },
       );
+    }
     if (cause.reason === "path" || cause.reason === "format")
-      return new AnalysisInputError(OPERATION, { cause }, [
-        {
-          path: ["path"],
-          reason: "invalid_format",
-          message: cause.message,
-        },
-      ]);
+      return new AnalysisInputError(
+        OPERATION,
+        { cause, ...stableArtifactInputRecovery(cause) },
+        [
+          {
+            path: ["path"],
+            reason: "invalid_format",
+            message: cause.message,
+          },
+        ],
+      );
   }
   if (cause instanceof Error && "code" in cause) {
     if (cause.code === "EACCES" || cause.code === "EPERM")
       return new AnalysisAccessDeniedError(OPERATION, input.path, cause.code, {
         cause,
       });
-    if (
-      ["ENOENT", "ENOTDIR", "ELOOP", "ENAMETOOLONG"].includes(
-        String(cause.code),
-      )
-    )
+    const pathErrno = artifactSelectedPathErrno(cause);
+    if (pathErrno !== undefined)
       return new AnalysisInputError(OPERATION, { cause }, [
         {
           path: ["path"],
           reason: "invalid_value",
-          message: `Selected BEAM file could not be read (${String(cause.code)}): ${input.path}.`,
+          message: `Selected BEAM file could not be read (${pathErrno}): ${input.path}.`,
         },
       ]);
   }
   return new ArtifactOperationError(
     OPERATION,
-    cause instanceof ArtifactReaderFailure ? cause.reason : "io",
+    origin === "owned-or-classified" && cause instanceof ArtifactReaderFailure
+      ? cause.reason
+      : "io",
     undefined,
     cause instanceof Error ? cause.message : "BEAM inspection failed.",
     { cause },
   );
 };
 
-const beamFailure = (
-  cause: unknown,
-  input: InspectErlangBeamInput,
-  signal: AbortSignal | undefined,
-) => {
-  const primary =
-    cause instanceof ArtifactFileCleanupFailure &&
-    cause.fileCleanupFailure.outcome.kind === "failed"
-      ? beamFailurePrimary(cause.fileCleanupFailure.outcome.cause, input)
-      : cause instanceof ArtifactFileCleanupFailure && signal?.aborted
-        ? new AnalysisCancelledError(OPERATION, { cause: signal.reason })
-        : beamFailurePrimary(cause, input);
-  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
-    return primary;
-  const cleanup = new ProviderCleanupError(
+const beamFailure = (cause: unknown, input: InspectErlangBeamInput) => {
+  const primary = beamFailurePrimary(artifactFilePrimaryFacts(cause), input);
+  return projectStableArtifactFailure(
+    cause,
+    primary,
+    input.path,
     ERLANG_BEAM_PROVIDER_IDENTITY.id,
-    cause.cleanup.resources,
-    { reason: cause.cleanup.reason },
-    { operation: OPERATION, cause },
+    OPERATION,
   );
-  const error = analysisErrorWithCleanupFailure(primary, cleanup, OPERATION);
-  bindArtifactFileCleanup(cause, error);
-  return error;
 };

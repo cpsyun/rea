@@ -1,3 +1,4 @@
+import { KunaDocumentError } from "./KunaDocumentError.js";
 import { KUNA_STRING_MIN_LENGTH } from "./KunaLimits.js";
 import { accessSync, constants, statSync } from "node:fs";
 
@@ -20,6 +21,10 @@ import {
   resolveRegexMatchingDeadline,
   type RegexMatchingDeadline,
 } from "../config/regexMatchingDeadline.js";
+import {
+  resolveRegexWorkerHeapRequest,
+  type RegexWorkerHeapRequest,
+} from "../config/regexWorkerHeapRequest.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import {
   kunaFileCleanupError,
@@ -35,10 +40,8 @@ import {
   inspectKunaInstallation,
 } from "./KunaInstallation.js";
 import { KunaProjectCache } from "./KunaProjectCache.js";
-import {
-  KUNA_PROVIDER_IDENTITY,
-  kunaCapabilities,
-} from "./KunaProviderCapabilities.js";
+import { kunaCapabilities } from "./KunaProviderCapabilities.js";
+import { KUNA_PROVIDER_IDENTITY } from "./KunaProviderMetadata.js";
 import { KUNA_COMMAND_REMEDIATION, KUNA_PROVIDER_ID } from "./KunaRelease.js";
 import { KunaRunSlots } from "./KunaRunSlots.js";
 import { KunaSessionClient } from "./KunaSessionClient.js";
@@ -58,6 +61,7 @@ const VERIFIED_ARCHITECTURES: ReadonlySet<string> = new Set([
 export class KunaProvider implements AnalysisProviderCandidate {
   readonly #environment: Readonly<NodeJS.ProcessEnv>;
   readonly #deadline: RegexMatchingDeadline;
+  readonly #heapRequest: RegexWorkerHeapRequest;
   readonly #platform: NodeJS.Platform;
   readonly #launcher: KunaProcessLauncher | undefined;
   readonly #probeTimeoutMs: number | undefined;
@@ -79,6 +83,11 @@ export class KunaProvider implements AnalysisProviderCandidate {
        * selected environment; an invalid setting is refused.
        */
       readonly regexMatchingDeadline?: RegexMatchingDeadline;
+      /**
+       * Heap request already resolved at startup. Omitted means resolve the
+       * selected environment; an invalid setting is refused.
+       */
+      readonly regexWorkerHeapRequest?: RegexWorkerHeapRequest;
     } = {},
   ) {
     this.#platform = options.platform ?? process.platform;
@@ -86,6 +95,9 @@ export class KunaProvider implements AnalysisProviderCandidate {
     this.#deadline =
       options.regexMatchingDeadline ??
       resolveRegexMatchingDeadline(this.#environment);
+    this.#heapRequest =
+      options.regexWorkerHeapRequest ??
+      resolveRegexWorkerHeapRequest(this.#environment);
     this.#launcher = options.launcher;
     this.#probeTimeoutMs = options.probeTimeoutMs;
     this.#singleFunctionRuns = options.singleFunctionRuns;
@@ -96,16 +108,10 @@ export class KunaProvider implements AnalysisProviderCandidate {
   }
 
   capabilities() {
-    const availability = this.inspectAvailability();
     return kunaCapabilities(
-      availability.status === "available"
-        ? { available: true }
-        : {
-            available: false,
-            reason: availability.reason,
-            code: availability.code,
-          },
+      this.inspectAvailability(),
       this.#deadline,
+      this.#heapRequest,
     );
   }
 
@@ -119,6 +125,7 @@ export class KunaProvider implements AnalysisProviderCandidate {
         status: "unavailable",
         code: configuration.error.code,
         reason: configuration.error.reason,
+        remediation: configuration.error.remediation,
         diagnostics: {
           configured: configuration.error.code !== "not_configured",
           version_probed: false,
@@ -127,12 +134,14 @@ export class KunaProvider implements AnalysisProviderCandidate {
     const { command } = configuration.value;
     try {
       accessSync(command, constants.X_OK);
-      if (!statSync(command).isFile()) throw new Error("not a regular file");
+      if (!statSync(command).isFile())
+        throw new KunaDocumentError("command_not_file");
     } catch (cause: unknown) {
       return {
         status: "unavailable",
         code: "executable_missing",
         reason: `Cannot execute REA_KUNA_COMMAND ${command}: ${cause instanceof Error ? cause.message : String(cause)}. ${KUNA_COMMAND_REMEDIATION}`,
+        remediation: KUNA_COMMAND_REMEDIATION,
         diagnostics: { configured: true, command, version_probed: false },
       };
     }
@@ -254,7 +263,8 @@ export class KunaProvider implements AnalysisProviderCandidate {
         {
           kuna_version: value.version,
           kuna_sha256: value.sha256,
-          verified_release: value.verified,
+          kuna_command: value.configuration.command,
+          kuna_executable: value.executable,
           jobs: value.configuration.jobs,
           export: "decompile-project",
           reference_graph: {
@@ -271,6 +281,7 @@ export class KunaProvider implements AnalysisProviderCandidate {
             termination: "any",
             xrefs: false,
           },
+          value_flow: "explicitly-unavailable-v1",
           cache_policy: "live",
         },
       ),
@@ -305,6 +316,7 @@ export class KunaProvider implements AnalysisProviderCandidate {
       runSlots: this.#foregroundSlots(configuration.value),
       environment: this.#environment,
       deadline: this.#deadline,
+      heapRequest: this.#heapRequest,
       ...(this.#launcher === undefined ? {} : { launcher: this.#launcher }),
     });
   }

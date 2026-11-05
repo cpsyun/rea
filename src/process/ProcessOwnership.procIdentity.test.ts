@@ -107,6 +107,7 @@ it("binds Linux credentials to the same native process generation", async () => 
         {
           state: "readable",
           identity: "linux-starttime:100",
+          name: "fixture",
           effectiveUid: 1001,
           // Kernel ptrace checks also compare the real and saved UIDs.
           environmentRestriction: "credentials",
@@ -175,6 +176,7 @@ it("keeps native identity when status UID is unavailable", async () => {
         {
           state: "readable",
           identity: "linux-starttime:100",
+          name: "fixture",
           lifecycle: { state: "observed", lifecycle: "non-zombie" },
           relation: {
             state: "observed",
@@ -349,6 +351,21 @@ it("keeps hidden or permission-denied live PIDs unavailable", async () => {
   } finally {
     signalProbe.mockRestore();
   }
+});
+
+it("preserves native identity with unavailable teardown relations", async () => {
+  const host = createSystemProcessOwnershipHost("linux", {});
+  filesystem.readFile.mockResolvedValueOnce(procStat(987654, 0, -1, 42, 4));
+  const identities = await host.processIdentities?.([entry]);
+  expect(identities?.get(42)).toMatchObject({
+    state: "readable",
+    identity: "linux-starttime:987654",
+    lifecycle: { state: "observed", lifecycle: "exiting" },
+    relation: {
+      state: "unavailable",
+      reason: "proc_stat_relation_unavailable",
+    },
+  });
 });
 
 it("keeps permission, parser, and unexpected failures unavailable", async () => {
